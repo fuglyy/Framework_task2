@@ -1,0 +1,64 @@
+/wsl-docker-install.md
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+.env.*.local
+
+# Logs
+logs/
+*.log
+pino-*.log
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.iml
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# Testing
+coverage/
+.nyc_output/
+*.lcov
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Package manager lock files (choose one)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
