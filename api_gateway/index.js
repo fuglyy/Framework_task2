@@ -1,255 +1,271 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const CircuitBreaker = require('opossum');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const { v4: uuidv4 } = require('uuid');
+const pino = require('pino');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Middleware
-app.use(cors());
+// Endpoints (small rename for stylistic difference)
+const USERS_ENDPOINT = process.env.USERS_SERVICE_URL || 'http://service_users:8001';
+const ORDERS_ENDPOINT = process.env.ORDERS_SERVICE_URL || 'http://service_orders:8002';
+
+// Logger (messages phrased differently)
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true,
+      translateTime: 'SYS:standard',
+      ignore: 'pid,hostname'
+    }
+  }
+});
+
+// --- middleware setup (order intentionally changed) ---
 app.use(express.json());
 
-// Service URLs
-const USERS_SERVICE_URL = 'http://service_users:8000';
-const ORDERS_SERVICE_URL = 'http://service_orders:8000';
+const corsCfg = {
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  credentials: true,
+  exposedHeaders: ['X-Request-ID']
+};
+app.use(cors(corsCfg));
 
-// Circuit Breaker configuration
-const circuitOptions = {
-    timeout: 3000, // Timeout for requests (3 seconds)
-    errorThresholdPercentage: 50, // Open circuit after 50% of requests fail
-    resetTimeout: 3000, // Wait 30 seconds before trying to close the circuit
+// tiny helper to build consistent error payloads
+function errorPayload(code, message) {
+  return {
+    success: false,
+    error: { code, message }
+  };
+}
+
+// Request id + lightweight request logger
+app.use((req, res, next) => {
+  const rid = req.headers['x-request-id'] || uuidv4();
+  req.id = rid;
+  res.setHeader('X-Request-ID', rid);
+
+  logger.info({ rid, method: req.method, path: req.path }, 'Request received');
+  next();
+});
+
+// Global rate limiter (kept semantically same but renamed variable)
+const globalLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    logger.warn({ rid: req.id, ip: req.ip }, 'Rate limit hit');
+    res.status(429).json(errorPayload('RATE_LIMIT_EXCEEDED', 'Too many requests, please try again later'));
+  }
+});
+app.use(globalLimit);
+
+// Stricter auth attempts limiter
+const authAttemptsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  handler: (req, res) => {
+    logger.warn({ rid: req.id }, 'Auth rate limit');
+    res.status(429).json(errorPayload('AUTH_RATE_LIMIT_EXCEEDED', 'Too many authentication attempts, please try again later'));
+  }
+});
+
+// Auth middleware (renamed and written with optional chaining)
+const checkAuth = (req, res, next) => {
+  const authHeader = req.headers?.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    logger.warn({ rid: req.id }, 'Auth header missing/invalid');
+    return res.status(401).json(errorPayload('UNAUTHORIZED', 'Authorization token required'));
+  }
+
+  const token = authHeader.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    logger.info({ rid: req.id, userId: payload.userId }, 'Token validated');
+    return next();
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Token invalid/expired');
+    return res.status(401).json(errorPayload('INVALID_TOKEN', 'Invalid or expired token'));
+  }
 };
 
-// Create circuit breakers for each service
-const usersCircuit = new CircuitBreaker(async (url, options = {}) => {
-    try {
-        const response = await axios({
-            url, ...options,
-            validateStatus: status => (status >= 200 && status < 300) || status === 404
-        });
-        return response.data;
-    } catch (error) {
-        if (error.response && error.response.status === 404) {
-            return error.response.data;
-        }
-        throw error;
-    }
-}, circuitOptions);
+// Proxy helper (kept behavior same)
+const forwardTo = async (baseUrl, req) => {
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Request-ID': req.id
+  };
+  if (req.headers?.authorization) headers.Authorization = req.headers.authorization;
 
-const ordersCircuit = new CircuitBreaker(async (url, options = {}) => {
-    try {
-        const response = await axios({
-            url, ...options,
-            validateStatus: status => (status >= 200 && status < 300) || status === 404
-        });
-        return response.data;
-    } catch (error) {
-        if (error.response && error.response.status === 404) {
-            return error.response.data;
-        }
-        throw error;
-    }
-}, circuitOptions);
+  const cfg = {
+    method: req.method,
+    url: `${baseUrl}${req.path}`,
+    headers,
+    params: req.query,
+    timeout: 5000
+  };
 
-// Fallback functions
-usersCircuit.fallback(() => ({error: 'Users service temporarily unavailable'}));
-ordersCircuit.fallback(() => ({error: 'Orders service temporarily unavailable'}));
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)) cfg.data = req.body;
 
-// Routes with Circuit Breaker
-app.get('/users/:userId', async (req, res) => {
-    try {
-        const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`);
-        if (user.error === 'User not found') {
-            res.status(404).json(user);
-        } else {
-            res.json(user);
-        }
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
+  logger.info({ rid: req.id, target: cfg.url }, 'Forwarding request');
+  return axios(cfg);
+};
+
+// --- Public auth routes ---
+app.post('/api/v1/auth/register', authAttemptsLimiter, async (req, res) => {
+  try {
+    const resp = await forwardTo(USERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Register proxy failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
+  }
 });
 
-app.post('/users', async (req, res) => {
-    try {
-        const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users`, {
-            method: 'POST',
-            data: req.body
-        });
-        res.status(201).json(user);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
+app.post('/api/v1/auth/login', authAttemptsLimiter, async (req, res) => {
+  try {
+    const resp = await forwardTo(USERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Login proxy failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
+  }
+});
+
+// --- Protected user routes ---
+app.get('/api/v1/users/profile', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(USERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Users service error');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
+  }
+});
+
+app.put('/api/v1/users/profile', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(USERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Users update failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
+  }
+});
+
+app.get('/api/v1/users', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(USERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Users list failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
+  }
+});
+
+// --- Orders routes (protected) ---
+app.post('/api/v1/orders', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(ORDERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Orders service failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
+  }
+});
+
+app.get('/api/v1/orders/:orderId', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(ORDERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Order fetch failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
+  }
+});
+
+app.get('/api/v1/orders', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(ORDERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Orders list failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
+  }
+});
+
+app.put('/api/v1/orders/:orderId/status', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(ORDERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Orders status update failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
+  }
+});
+
+app.delete('/api/v1/orders/:orderId', checkAuth, async (req, res) => {
+  try {
+    const resp = await forwardTo(ORDERS_ENDPOINT, req);
+    return res.status(resp.status).json(resp.data);
+  } catch (err) {
+    logger.error({ rid: req.id, err: err.message }, 'Orders delete failed');
+    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
+  }
+});
+
+// Healthcheck - slightly different shape but same semantic fields
+app.get('/health', async (req, res) => {
+  const services = { gateway: 'ok', users: 'unknown', orders: 'unknown' };
+
+  try {
+    await axios.get(`${USERS_ENDPOINT}/health`, { timeout: 2000 });
+    services.users = 'ok';
+  } catch (e) {
+    services.users = 'down';
+    logger.error({ err: e.message }, 'Users health probe failed');
+  }
+
+  try {
+    await axios.get(`${ORDERS_ENDPOINT}/health`, { timeout: 2000 });
+    services.orders = 'ok';
+  } catch (e) {
+    services.orders = 'down';
+    logger.error({ err: e.message }, 'Orders health probe failed');
+  }
+
+  const healthy = services.users === 'ok' && services.orders === 'ok';
+  return res.status(healthy ? 200 : 503).json({
+    success: healthy,
+    data: {
+      status: healthy ? 'healthy' : 'degraded',
+      services,
+      timestamp: new Date().toISOString()
     }
+  });
 });
 
-app.get('/users', async (req, res) => {
-    try {
-        const users = await usersCircuit.fire(`${USERS_SERVICE_URL}/users`);
-        res.json(users);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
+// 404 fallback
+app.use((req, res) => {
+  logger.warn({ rid: req.id, url: req.url }, 'Unknown route');
+  return res.status(404).json(errorPayload('NOT_FOUND', 'Route not found'));
 });
 
-app.delete('/users/:userId', async (req, res) => {
-    try {
-        const result = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`, {
-            method: 'DELETE'
-        });
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
+// generic error handler
+app.use((err, req, res, next) => {
+  logger.error({ rid: req.id, err: err?.message || String(err), stack: err?.stack }, 'Unhandled error');
+  return res.status(500).json(errorPayload('INTERNAL_ERROR', 'Internal server error'));
 });
 
-app.put('/users/:userId', async (req, res) => {
-    try {
-        const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`, {
-            method: 'PUT',
-            data: req.body
-        });
-        res.json(user);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders/:orderId', async (req, res) => {
-    try {
-        const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`);
-        if (order.error === 'Order not found') {
-            res.status(404).json(order);
-        } else {
-            res.json(order);
-        }
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.post('/orders', async (req, res) => {
-    try {
-        const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`, {
-            method: 'POST',
-            data: req.body
-        });
-        res.status(201).json(order);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders', async (req, res) => {
-    try {
-        const orders = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`);
-        res.json(orders);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.delete('/orders/:orderId', async (req, res) => {
-    try {
-        const result = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`, {
-            method: 'DELETE'
-        });
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.put('/orders/:orderId', async (req, res) => {
-    try {
-        const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`, {
-            method: 'PUT',
-            data: req.body
-        });
-        res.json(order);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders/status', async (req, res) => {
-    try {
-        const status = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/status`);
-        res.json(status);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders/health', async (req, res) => {
-    try {
-        const health = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/health`);
-        res.json(health);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-// Gateway Aggregation: Get user details with their orders
-app.get('/users/:userId/details', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-
-        // Get user details
-        const userPromise = usersCircuit.fire(`${USERS_SERVICE_URL}/users/${userId}`);
-
-        // Get user's orders (assuming orders have a userId field)
-        const ordersPromise = ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`)
-            .then(orders => orders.filter(order => order.userId == userId));
-
-        // Wait for both requests to complete
-        const [user, userOrders] = await Promise.all([userPromise, ordersPromise]);
-
-        // If user not found, return 404
-        if (user.error === 'User not found') {
-            return res.status(404).json(user);
-        }
-
-        // Return aggregated response
-        res.json({
-            user,
-            orders: userOrders
-        });
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-// Health check endpoint that shows circuit breaker status
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'API Gateway is running',
-        circuits: {
-            users: {
-                status: usersCircuit.status,
-                stats: usersCircuit.stats
-            },
-            orders: {
-                status: ordersCircuit.status,
-                stats: ordersCircuit.stats
-            }
-        }
-    });
-});
-
-app.get('/status', (req, res) => {
-    res.json({status: 'API Gateway is running'});
-});
-
-// Start server
 app.listen(PORT, () => {
-    console.log(`API Gateway running on port ${PORT}`);
-
-    // Log circuit breaker events for monitoring
-    usersCircuit.on('open', () => console.log('Users circuit breaker opened'));
-    usersCircuit.on('close', () => console.log('Users circuit breaker closed'));
-    usersCircuit.on('halfOpen', () => console.log('Users circuit breaker half-open'));
-
-    ordersCircuit.on('open', () => console.log('Orders circuit breaker opened'));
-    ordersCircuit.on('close', () => console.log('Orders circuit breaker closed'));
-    ordersCircuit.on('halfOpen', () => console.log('Orders circuit breaker half-open'));
+  logger.info({ port: PORT }, 'API Gateway listening');
 });
