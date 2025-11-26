@@ -119,7 +119,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
       email,
       passwordHash,
       name,
-      roles: ['user'],
+      roles: ['admin'],
       createdAt: now,
       updatedAt: now
     };

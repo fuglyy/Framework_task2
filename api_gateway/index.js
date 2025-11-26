@@ -10,11 +10,10 @@ const app = express();
 const PORT = process.env.PORT || 8000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Endpoints (small rename for stylistic difference)
 const USERS_ENDPOINT = process.env.USERS_SERVICE_URL || 'http://service_users:8001';
 const ORDERS_ENDPOINT = process.env.ORDERS_SERVICE_URL || 'http://service_orders:8002';
 
-// Logger (messages phrased differently)
+// Logger
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: {
@@ -27,245 +26,163 @@ const logger = pino({
   }
 });
 
-// --- middleware setup (order intentionally changed) ---
 app.use(express.json());
+app.use(cors({ origin: '*', credentials: true, exposedHeaders: ['X-Request-ID'] }));
 
-const corsCfg = {
-  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
-  credentials: true,
-  exposedHeaders: ['X-Request-ID']
-};
-app.use(cors(corsCfg));
-
-// tiny helper to build consistent error payloads
+// Unified error format helper
 function errorPayload(code, message) {
-  return {
-    success: false,
-    error: { code, message }
-  };
+  return { success: false, error: { code, message } };
 }
 
-// Request id + lightweight request logger
+// Assign X-Request-ID
 app.use((req, res, next) => {
-  const rid = req.headers['x-request-id'] || uuidv4();
-  req.id = rid;
-  res.setHeader('X-Request-ID', rid);
-
-  logger.info({ rid, method: req.method, path: req.path }, 'Request received');
+  req.id = req.headers['x-request-id'] || uuidv4();
+  res.setHeader('X-Request-ID', req.id);
   next();
 });
 
-// Global rate limiter (kept semantically same but renamed variable)
-const globalLimit = rateLimit({
+// Rate limiting
+app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    logger.warn({ rid: req.id, ip: req.ip }, 'Rate limit hit');
-    res.status(429).json(errorPayload('RATE_LIMIT_EXCEEDED', 'Too many requests, please try again later'));
-  }
-});
-app.use(globalLimit);
+  standardHeaders: true
+}));
 
-// Stricter auth attempts limiter
 const authAttemptsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 50,
-  handler: (req, res) => {
-    logger.warn({ rid: req.id }, 'Auth rate limit');
-    res.status(429).json(errorPayload('AUTH_RATE_LIMIT_EXCEEDED', 'Too many authentication attempts, please try again later'));
-  }
+  max: 50
 });
 
-// Auth middleware (renamed and written with optional chaining)
+// JWT middleware
 const checkAuth = (req, res, next) => {
-  const authHeader = req.headers?.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    logger.warn({ rid: req.id }, 'Auth header missing/invalid');
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer '))
     return res.status(401).json(errorPayload('UNAUTHORIZED', 'Authorization token required'));
-  }
 
-  const token = authHeader.slice(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    logger.info({ rid: req.id, userId: payload.userId }, 'Token validated');
-    return next();
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Token invalid/expired');
+    req.user = jwt.verify(authHeader.slice(7), JWT_SECRET);
+    next();
+  } catch {
     return res.status(401).json(errorPayload('INVALID_TOKEN', 'Invalid or expired token'));
   }
 };
 
-// Proxy helper (kept behavior same)
-const forwardTo = async (baseUrl, req) => {
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-Request-ID': req.id
-  };
-  if (req.headers?.authorization) headers.Authorization = req.headers.authorization;
-
+// Universal proxy with REAL error handling
+async function forward(baseUrl, req, res) {
   const cfg = {
     method: req.method,
     url: `${baseUrl}${req.path}`,
-    headers,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Request-ID': req.id,
+      ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {})
+    },
     params: req.query,
     timeout: 5000
   };
 
   if (['POST', 'PUT', 'PATCH'].includes(req.method)) cfg.data = req.body;
 
-  logger.info({ rid: req.id, target: cfg.url }, 'Forwarding request');
-  return axios(cfg);
-};
-
-// --- Public auth routes ---
-app.post('/api/v1/auth/register', authAttemptsLimiter, async (req, res) => {
   try {
-    const resp = await forwardTo(USERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
+    const serviceResp = await axios(cfg);
+    return res.status(serviceResp.status).json(serviceResp.data);
   } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Register proxy failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
-  }
-});
-
-app.post('/api/v1/auth/login', authAttemptsLimiter, async (req, res) => {
-  try {
-    const resp = await forwardTo(USERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Login proxy failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
-  }
-});
-
-// --- Protected user routes ---
-app.get('/api/v1/users/profile', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(USERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Users service error');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
-  }
-});
-
-app.put('/api/v1/users/profile', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(USERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Users update failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
-  }
-});
-
-app.get('/api/v1/users', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(USERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Users list failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Users service is temporarily unavailable'));
-  }
-});
-
-// --- Orders routes (protected) ---
-app.post('/api/v1/orders', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(ORDERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Orders service failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
-  }
-});
-
-app.get('/api/v1/orders/:orderId', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(ORDERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Order fetch failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
-  }
-});
-
-app.get('/api/v1/orders', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(ORDERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Orders list failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
-  }
-});
-
-app.put('/api/v1/orders/:orderId/status', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(ORDERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Orders status update failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
-  }
-});
-
-app.delete('/api/v1/orders/:orderId', checkAuth, async (req, res) => {
-  try {
-    const resp = await forwardTo(ORDERS_ENDPOINT, req);
-    return res.status(resp.status).json(resp.data);
-  } catch (err) {
-    logger.error({ rid: req.id, err: err.message }, 'Orders delete failed');
-    return res.status(503).json(errorPayload('SERVICE_UNAVAILABLE', 'Orders service is temporarily unavailable'));
-  }
-});
-
-// Healthcheck - slightly different shape but same semantic fields
-app.get('/health', async (req, res) => {
-  const services = { gateway: 'ok', users: 'unknown', orders: 'unknown' };
-
-  try {
-    await axios.get(`${USERS_ENDPOINT}/health`, { timeout: 2000 });
-    services.users = 'ok';
-  } catch (e) {
-    services.users = 'down';
-    logger.error({ err: e.message }, 'Users health probe failed');
-  }
-
-  try {
-    await axios.get(`${ORDERS_ENDPOINT}/health`, { timeout: 2000 });
-    services.orders = 'ok';
-  } catch (e) {
-    services.orders = 'down';
-    logger.error({ err: e.message }, 'Orders health probe failed');
-  }
-
-  const healthy = services.users === 'ok' && services.orders === 'ok';
-  return res.status(healthy ? 200 : 503).json({
-    success: healthy,
-    data: {
-      status: healthy ? 'healthy' : 'degraded',
-      services,
-      timestamp: new Date().toISOString()
+    // 1) SERVICE ANSWERED WITH AN ERROR (like 400 / 401 / 403 / 404 / 409)
+    if (err.response) {
+      return res.status(err.response.status).json(
+        err.response.data?.error
+          ? err.response.data // { success:false, error:{...} }
+          : errorPayload('SERVICE_ERROR', 'Service returned an error')
+      );
     }
-  });
+
+    // 2) TIMEOUT / CONNECTION REFUSED → REAL SERVICE DOWN
+    return res.status(503).json(
+      errorPayload(
+        'SERVICE_UNAVAILABLE',
+        `${baseUrl.includes('users') ? 'Users' : 'Orders'} service is temporarily unavailable`
+      )
+    );
+  }
+}
+
+// AUTH
+app.post('/api/v1/auth/register', authAttemptsLimiter, (req, res) =>
+  forward(USERS_ENDPOINT, req, res)
+);
+
+app.post('/api/v1/auth/login', authAttemptsLimiter, (req, res) =>
+  forward(USERS_ENDPOINT, req, res)
+);
+
+// USERS
+app.get('/api/v1/users/profile', checkAuth, (req, res) =>
+  forward(USERS_ENDPOINT, req, res)
+);
+
+app.put('/api/v1/users/profile', checkAuth, (req, res) =>
+  forward(USERS_ENDPOINT, req, res)
+);
+
+app.get('/api/v1/users', checkAuth, (req, res) =>
+  forward(USERS_ENDPOINT, req, res)
+);
+
+// ORDERS
+app.post('/api/v1/orders', checkAuth, (req, res) =>
+  forward(ORDERS_ENDPOINT, req, res)
+);
+
+app.get('/api/v1/orders/:orderId', checkAuth, (req, res) =>
+  forward(ORDERS_ENDPOINT, req, res)
+);
+
+app.get('/api/v1/orders', checkAuth, (req, res) =>
+  forward(ORDERS_ENDPOINT, req, res)
+);
+
+app.put('/api/v1/orders/:orderId/status', checkAuth, (req, res) =>
+  forward(ORDERS_ENDPOINT, req, res)
+);
+
+app.delete('/api/v1/orders/:orderId', checkAuth, (req, res) =>
+  forward(ORDERS_ENDPOINT, req, res)
+);
+
+// HEALTH
+app.get('/health', async (req, res) => {
+  const data = {
+    status: 'healthy',
+    services: { gateway: 'ok', users: 'ok', orders: 'ok' }
+  };
+
+  try {
+    await axios.get(`${USERS_ENDPOINT}/health`, { timeout: 1500 });
+  } catch {
+    data.status = 'degraded';
+    data.services.users = 'down';
+  }
+
+  try {
+    await axios.get(`${ORDERS_ENDPOINT}/health`, { timeout: 1500 });
+  } catch {
+    data.status = 'degraded';
+    data.services.orders = 'down';
+  }
+
+  res.status(data.status === 'healthy' ? 200 : 503).json({ success: true, data });
 });
 
-// 404 fallback
-app.use((req, res) => {
-  logger.warn({ rid: req.id, url: req.url }, 'Unknown route');
-  return res.status(404).json(errorPayload('NOT_FOUND', 'Route not found'));
-});
+// 404
+app.use((req, res) =>
+  res.status(404).json(errorPayload('NOT_FOUND', 'Route not found'))
+);
 
-// generic error handler
-app.use((err, req, res, next) => {
-  logger.error({ rid: req.id, err: err?.message || String(err), stack: err?.stack }, 'Unhandled error');
-  return res.status(500).json(errorPayload('INTERNAL_ERROR', 'Internal server error'));
-});
+// 500 fallback
+app.use((err, req, res, next) =>
+  res.status(500).json(errorPayload('INTERNAL_ERROR', 'Internal server error'))
+);
 
-app.listen(PORT, () => {
-  logger.info({ port: PORT }, 'API Gateway listening');
-});
+app.listen(PORT, () =>
+  logger.info({ port: PORT }, 'Gateway running')
+);
